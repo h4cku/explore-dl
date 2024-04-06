@@ -1,22 +1,25 @@
-// Activation Functions 
-function _sigmoid(x) {
-    return 1 / (1 + Math.exp(-x));
-}
+// Activation Functions
+class ActivationFunction {
 
-function _tanh(x) {
-    return (1 - Math.exp(-x)) / (1 + Math.exp(-x));
-}
+    static sigmoid(x) {
+        return 1 / (1 + Math.exp(-x));
+    }
 
-function _relu(x) {
-    return x > 0 ? x : 0;
-}
+    static tanh(x) {
+        return (1 - Math.exp(-x)) / (1 + Math.exp(-x));
+    }
 
-function _gelu(x) {
-    return x * _sigmoid(1.702 * x);
-}
+    static relu(x) {
+        return x > 0 ? x : 0;
+    }
 
-function _silu(x) {
-    return x * _sigmoid(x);
+    static gelu(x) {
+        return x * ActivationFunction.sigmoid(1.702 * x);
+    }
+
+    static silu(x) {
+        return x * ActivationFunction.sigmoid(x);
+    }
 }
 
 // Tensor class
@@ -25,12 +28,20 @@ class Tensor {
         this.data = data;
         this.shape = shape;
         this.stride = Array(this.shape.length);
-        this.broadcast_idx = -1;
+        this.stride_ = Array(this.shape.length);
         let acc = 1;
         for (let i = this.shape.length - 1; i >= 0; i--) {
-            this.stride[i] = acc;
+            this.stride_[i] = acc; // this will keep the real striding
+            if (this.shape[i] == 1)
+                this.stride[i] = 0; // to allow broadcasting
+            else
+                this.stride[i] = acc;
             acc *= this.shape[i];
         }
+    }
+
+    item() {
+        return this.data[0];
     }
 
     match_dimension(m) {
@@ -43,17 +54,6 @@ class Tensor {
             }
         }
         return true;
-    }
-
-    broadcast(i) {
-        if (this.shape[i] == 1) {
-            this.broadcast_idx = i;
-            this.stride[i] = 0;
-        }
-    }
-
-    get_broadcast_idx() {
-        return this.broadcast_idx;
     }
 
     reshape(new_shape) {
@@ -107,7 +107,7 @@ class Tensor {
     get_idx(i) {
         let idx = [];
         for (let j = 0; j < this.stride.length; j++) {
-            let t_ = Math.floor(i / this.stride[j]);
+            let t_ = Math.floor(i / this.stride_[j]);
             i = i - t_ * this.stride[j];
             idx.push(t_)
         }
@@ -279,10 +279,13 @@ class AddBackward {
     }
     call(loss) {
         this.x.backward(loss);
-        if (this.y.val.get_broadcast_idx() >= 0)
-            this.y.backward(loss.sum(this.y.val.get_broadcast_idx()))
-        else
-            this.y.backward(loss);
+        // Shrink over broadcast axis
+        for (let i = 0; i < this.y.val.stride.length; i++) {
+            if (this.y.val.stride[i] == 0) {
+                loss = loss.sum(i);
+            }
+        }
+        this.y.backward(loss);
     }
 }
 
@@ -293,10 +296,12 @@ class SubBackward {
     }
     call(loss) {
         this.x.backward(loss);
-        if (this.y.val.get_broadcast_idx() >= 0)
-            this.y.backward(loss.sum(this.y.val.get_broadcast_idx()).times(-1))
-        else
-            this.y.backward(loss.times(-1));
+        for (let i = 0; i < this.y.val.stride.length; i++) {
+            if (this.y.val.stride[i] == 0) {
+                loss = loss.sum(i);
+            }
+        }
+        this.y.backward(loss.times(-1));
     }
 }
 
@@ -307,10 +312,13 @@ class MulBackward {
     }
     call(loss) {
         this.x.backward(loss.mul(y.val));
-        if (this.y.val.get_broadcast_idx() >= 0)
-            this.y.backward(loss.mul(x.val).sum(this.y.val.get_broadcast_idx()))
-        else
-            this.y.backward(loss.mul(x.val));
+        loss = loss.mul(x.val);
+        for (let i = 0; i < this.y.val.stride.length; i++) {
+            if (this.y.val.stride[i] == 0) {
+                loss = loss.sum(i);
+            }
+        }
+        this.y.backward(loss);
     }
 }
 
@@ -324,10 +332,13 @@ class DivBackward {
     }
     call(loss) {
         this.x.backward(loss.div(this.y.val));
-        if (this.y.val.get_broadcast_idx() >= 0)
-            this.y.backward(loss.mul(this.x.val.apply_binary_op(this.y.val, this.helper)).sum(this.y.val.get_broadcast_idx()))
-        else
-            this.y.backward(loss.mul(this.x.val.apply_binary_op(this.y.val, this.helper)));
+        loss = loss.mul(this.x.val.apply_binary_op(this.y.val, this.helper));
+        for (let i = 0; i < this.y.val.stride.length; i++) {
+            if (this.y.val.stride[i] == 0) {
+                loss = loss.sum(i);
+            }
+        }
+        this.y.backward(loss);
     };
 }
 
@@ -361,7 +372,6 @@ class MeanBackward {
     call(loss) {
         let t_ = new Tensor(Array(this.x.val.get_dim()), this.x.val.shape);
         t_.ones();
-        loss.broadcast(this.axis);
         t_ = t_.mul(loss)
         this.x.backward(t_.times(1 / this.x.val.shape[this.axis]));
     }
@@ -406,9 +416,7 @@ class Variable {
         this.grad.zeros();
         this.backward_hook = backward_hook; // if this is null it means it is a leaf of the graph
     }
-    broadcast(i) {
-        this.val.broadcast(i);
-    }
+
     backward(loss) {
         if (this.backward_hook) {
             this.backward_hook.call(loss);
@@ -452,13 +460,13 @@ class Variable {
         return o;
     }
     static sigmoid(v) {
-        let new_val = v.val.apply_unitary_op(_sigmoid);
+        let new_val = v.val.apply_unitary_op(ActivationFunction.sigmoid);
         let o = new Variable(new_val, new NopBackward());
         o.backward_hook = new SigmoidBackward(v, o);
         return o;
     }
     static tanh(v) {
-        let new_val = v.val.apply_unitary_op(_tanh);
+        let new_val = v.val.apply_unitary_op(ActivationFunction.tanh);
         let o = new Variable(new_val, new NopBackward());
         o.backward_hook = new TanhBackward(v, o);
         return o;
@@ -468,7 +476,7 @@ class Variable {
 // Loss functions
 class Loss {
     static mse_loss(o, t) {
-        return o.sub(t).mean(0).mean(1)
+        return o.sub(t).pow(2).mean(0).mean(1)
     }
 
     static cross_entropy_loss() {
@@ -492,7 +500,7 @@ class SGD {
 
     step() {
         for (let i = 0; i < this.params.length; i++) {
-            this.params[i].data -= this.lr * this.params[i].grad
+            this.params[i].val = this.params[i].val.sub(this.params[i].grad.times(this.lr))
         }
     }
 }
@@ -508,14 +516,23 @@ class Linear {
         this.b = new Variable(b_, null)
     }
 
+    parameters() {
+        return [this.W, this.b];
+    }
+
     forward(x) {
-        return x.dot(this.W).add(this.b)
+        let o = x.dot(this.W).add(this.b)
+        return o
     }
 }
 
 class Sigmoid {
     constructor() {
 
+    }
+
+    parameters() {
+        return [];
     }
 
     forward(x) {
@@ -528,6 +545,10 @@ class Tanh {
 
     }
 
+    parameters() {
+        return [];
+    }
+
     forward(x) {
         return Variable.sigmoid(x)
     }
@@ -536,6 +557,14 @@ class Tanh {
 class Sequential {
     constructor(layers) {
         this.layers = layers;
+    }
+
+    parameters() {
+        let o = []
+        for (let i = 0; i < this.layers.length; i++) {
+            o = [...o, ...this.layers[i].parameters()]
+        }
+        return o
     }
 
     forward(x) {
@@ -548,10 +577,24 @@ class Sequential {
 }
 
 let model = new Sequential([
-    new Linear(2, 5),
-    new Sigmoid(),
-    new Linear(5, 1)
+    new Linear(2, 3),
+    new Tanh(),
+    new Linear(3, 1)
 ])
 
-let x = new Variable(new Tensor([2, 3], [1, 2]), new NopBackward())
-console.log(model.forward(x))
+let x = new Variable(new Tensor([2, 3, 5, 6, 7, 9], [3, 2]), new NopBackward())
+let y = new Variable(new Tensor([3, 5, 7], [3, 1]), new NopBackward())
+
+let optim = new SGD(model.parameters(), { lr: 0.1 });
+
+console.log(model.forward(x).val.data)
+let epochs = 10
+for (let epoch = 0; epoch < epochs; epoch++) {
+    optim.zero_grad();
+    let o = model.forward(x);
+    let l = Loss.mse_loss(o, y);
+    console.log(l.val.item());
+    l.backward(new Tensor([1], [1, 1]));
+    optim.step();
+}
+console.log(model.forward(x).val.data)

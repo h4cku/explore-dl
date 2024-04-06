@@ -163,6 +163,12 @@ class Tensor {
         return o;
     }
 
+    mean(axis) {
+        let o = this.sum(axis);
+        o = o.times(1 / this.shape[axis]);
+        return o
+    }
+
     add(m) {
         if (!this.match_dimension(m)) {
             return null;
@@ -247,6 +253,13 @@ class Tensor {
 
         return o;
     }
+    pow(e) {
+        let new_data = []
+        for (let i = 0; i < this.data.length; i++) {
+            new_data.push(Math.pow(this.data[i], e));
+        }
+        return new Tensor(new_data, [... this.shape]);
+    }
 }
 
 // Backward Classes
@@ -329,6 +342,31 @@ class DotBackward {
     };
 }
 
+class PowBackward {
+    constructor(x, o, e) {
+        this.x = x;
+        this.o = o;
+        this.e = e;
+    }
+    call(loss) {
+        this.x.backward(loss.mul(this.o.val.div(this.x.val).times(this.e)))
+    }
+}
+
+class MeanBackward {
+    constructor(x, axis) {
+        this.x = x;
+        this.axis = axis;
+    }
+    call(loss) {
+        let t_ = new Tensor(Array(this.x.val.get_dim()), this.x.val.shape);
+        t_.ones();
+        loss.broadcast(this.axis);
+        t_ = t_.mul(loss)
+        this.x.backward(t_.times(1 / this.x.val.shape[this.axis]));
+    }
+}
+
 class SigmoidBackward {
     constructor(x, o) {
         this.x = x;
@@ -403,6 +441,16 @@ class Variable {
         let new_val = this.val.dot(v.val);
         return new Variable(new_val, new DotBackward(this, v));
     }
+    mean(axis) {
+        let new_val = this.val.mean(axis);
+        return new Variable(new_val, new MeanBackward(this, axis));
+    }
+    pow(e) {
+        let new_val = this.val.pow(e);
+        let o = new Variable(new_val, new NopBackward());
+        o.backward_hook = new PowBackward(this, o, e);
+        return o;
+    }
     static sigmoid(v) {
         let new_val = v.val.apply_unitary_op(_sigmoid);
         let o = new Variable(new_val, new NopBackward());
@@ -420,7 +468,7 @@ class Variable {
 // Loss functions
 class Loss {
     static mse_loss(o, t) {
-
+        return o.sub(t).mean(0).mean(1)
     }
 
     static cross_entropy_loss() {

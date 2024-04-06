@@ -1,5 +1,22 @@
+// Activation Functions 
 function _sigmoid(x) {
     return 1 / (1 + Math.exp(-x));
+}
+
+function _tanh(x) {
+    return (1 - Math.exp(-x)) / (1 + Math.exp(-x));
+}
+
+function _relu(x) {
+    return x > 0 ? x : 0;
+}
+
+function _gelu(x) {
+    return x * _sigmoid(1.702 * x);
+}
+
+function _silu(x) {
+    return x * _sigmoid(x);
 }
 
 // Tensor class
@@ -8,7 +25,8 @@ class Tensor {
         this.data = data;
         this.shape = shape;
         this.stride = Array(this.shape.length);
-        let acc = 1
+        this.broadcast_idx = -1;
+        let acc = 1;
         for (let i = this.shape.length - 1; i >= 0; i--) {
             this.stride[i] = acc;
             acc *= this.shape[i];
@@ -29,8 +47,13 @@ class Tensor {
 
     broadcast(i) {
         if (this.shape[i] == 1) {
+            this.broadcast_idx = i;
             this.stride[i] = 0;
         }
+    }
+
+    get_broadcast_idx() {
+        return this.broadcast_idx;
     }
 
     reshape(new_shape) {
@@ -91,6 +114,22 @@ class Tensor {
         return idx;
     }
 
+    get_pos(idx) {
+        let s = 0;
+        for (let i = 0; i < idx.length; i++) {
+            s += idx[i] * this.stride[i];
+        }
+        return s;
+    }
+
+    get_dim() {
+        let acc = 1;
+        for (let i = 0; i < this.shape.length; i++) {
+            acc *= this.shape[i];
+        }
+        return acc;
+    }
+
     apply_unitary_op(f) {
         let new_data = []
         for (let i = 0; i < this.data.length; i++) {
@@ -109,6 +148,19 @@ class Tensor {
             new_data.push(f(this.data[i], m.at(idx)));
         }
         return new Tensor(new_data, [... this.shape]);
+    }
+
+    sum(axis) {
+        let new_shape = [...this.shape];
+        new_shape[axis] = 1;
+        let o = new Tensor(Array(this.get_dim() / this.shape[axis]), new_shape);
+        o.zeros();
+        for (let i = 0; i < this.data.length; i++) {
+            let idx = this.get_idx(i);
+            idx[axis] = 0;
+            o.data[o.get_pos(idx)] += this.data[i];
+        }
+        return o;
     }
 
     add(m) {
@@ -197,6 +249,7 @@ class Tensor {
     }
 }
 
+// Backward Classes
 class NopBackward {
     constructor() {
 
@@ -213,7 +266,10 @@ class AddBackward {
     }
     call(loss) {
         this.x.backward(loss);
-        this.y.backward(loss);
+        if (this.y.val.get_broadcast_idx() >= 0)
+            this.y.backward(loss.sum(this.y.val.get_broadcast_idx()))
+        else
+            this.y.backward(loss);
     }
 }
 
@@ -224,7 +280,10 @@ class SubBackward {
     }
     call(loss) {
         this.x.backward(loss);
-        this.y.backward(loss.times(-1));
+        if (this.y.val.get_broadcast_idx() >= 0)
+            this.y.backward(loss.sum(this.y.val.get_broadcast_idx()).times(-1))
+        else
+            this.y.backward(loss.times(-1));
     }
 }
 
@@ -235,7 +294,10 @@ class MulBackward {
     }
     call(loss) {
         this.x.backward(loss.mul(y.val));
-        this.y.backward(loss.mul(x.val));
+        if (this.y.val.get_broadcast_idx() >= 0)
+            this.y.backward(loss.mul(x.val).sum(this.y.val.get_broadcast_idx()))
+        else
+            this.y.backward(loss.mul(x.val));
     }
 }
 
@@ -249,7 +311,10 @@ class DivBackward {
     }
     call(loss) {
         this.x.backward(loss.div(this.y.val));
-        this.y.backward(loss.mul(this.x.val.apply_binary_op(this.y.val, this.helper)));
+        if (this.y.val.get_broadcast_idx() >= 0)
+            this.y.backward(loss.mul(this.x.val.apply_binary_op(this.y.val, this.helper)).sum(this.y.val.get_broadcast_idx()))
+        else
+            this.y.backward(loss.mul(this.x.val.apply_binary_op(this.y.val, this.helper)));
     };
 }
 
@@ -259,8 +324,8 @@ class DotBackward {
         this.y = y;
     }
     call(loss) {
-        this.x.backward(loss.dot(this.y.transpose(0, 1)));
-        this.y.backward(this.x.transpose(0, 1).dot(loss));
+        this.x.backward(loss.dot(this.y.val.transpose(0, 1)));
+        this.y.backward(this.x.val.transpose(0, 1).dot(loss));
     };
 }
 
@@ -277,7 +342,21 @@ class SigmoidBackward {
     }
 }
 
-// Variable
+class TanhBackward {
+    constructor(x, o) {
+        this.x = x;
+        this.o = o;
+    }
+    helper(x) {
+        return (1 - x ** 2) / 2
+    }
+    call(loss) {
+        this.x.backward(loss.mul(this.o.val.apply_unitary_op(this.helper)))
+    }
+}
+
+// Variable class 
+// This a wrapper for tensor objects to be able to perform autodifferntiation
 class Variable {
     constructor(t, backward_hook) {
         this.val = t;
@@ -289,11 +368,19 @@ class Variable {
         this.grad.zeros();
         this.backward_hook = backward_hook; // if this is null it means it is a leaf of the graph
     }
+    broadcast(i) {
+        this.val.broadcast(i);
+    }
     backward(loss) {
         if (this.backward_hook) {
             this.backward_hook.call(loss);
         } else {
             this.grad = this.grad.add(loss);
+        }
+    }
+    zero_grad() {
+        if (this.grad) {
+            this.grad.zeros()
         }
     }
     add(v) {
@@ -316,13 +403,50 @@ class Variable {
         let new_val = this.val.dot(v.val);
         return new Variable(new_val, new DotBackward(this, v));
     }
+    static sigmoid(v) {
+        let new_val = v.val.apply_unitary_op(_sigmoid);
+        let o = new Variable(new_val, new NopBackward());
+        o.backward_hook = new SigmoidBackward(v, o);
+        return o;
+    }
+    static tanh(v) {
+        let new_val = v.val.apply_unitary_op(_tanh);
+        let o = new Variable(new_val, new NopBackward());
+        o.backward_hook = new TanhBackward(v, o);
+        return o;
+    }
 }
 
-function sigmoid(v) {
-    let new_val = v.val.apply_unitary_op(_sigmoid);
-    let o = new Variable(new_val, new NopBackward());
-    o.backward_hook = new SigmoidBackward(v, o);
-    return o;
+// Loss functions
+class Loss {
+    static mse_loss(o, t) {
+
+    }
+
+    static cross_entropy_loss() {
+
+    }
+}
+
+// Optimizers
+
+class SGD {
+    constructor(params, hparams) {
+        this.params = params;
+        this.lr = hparams.lr;
+    }
+
+    zero_grad() {
+        for (let i = 0; i < this.params.length; i++) {
+            this.params[i].zero_grad()
+        }
+    }
+
+    step() {
+        for (let i = 0; i < this.params.length; i++) {
+            this.params[i].data -= this.lr * this.params[i].grad
+        }
+    }
 }
 
 // Nerual Network Layers
@@ -337,7 +461,7 @@ class Linear {
     }
 
     forward(x) {
-        return x.dot(this.W).add(b)
+        return x.dot(this.W).add(this.b)
     }
 }
 
@@ -347,11 +471,39 @@ class Sigmoid {
     }
 
     forward(x) {
-        return sigmoid(x)
+        return Variable.sigmoid(x)
     }
 }
 
-let x = new Tensor([1, 2, 3, 4], [2, 2]);
-let y = x.dot(x.transpose(0, 1))
+class Tanh {
+    constructor() {
 
-console.log(y)
+    }
+
+    forward(x) {
+        return Variable.sigmoid(x)
+    }
+}
+
+class Sequential {
+    constructor(layers) {
+        this.layers = layers;
+    }
+
+    forward(x) {
+        let o = x;
+        for (let i = 0; i < this.layers.length; i++) {
+            o = this.layers[i].forward(o)
+        }
+        return o;
+    }
+}
+
+let model = new Sequential([
+    new Linear(2, 5),
+    new Sigmoid(),
+    new Linear(5, 1)
+])
+
+let x = new Variable(new Tensor([2, 3], [1, 2]), new NopBackward())
+console.log(model.forward(x))
